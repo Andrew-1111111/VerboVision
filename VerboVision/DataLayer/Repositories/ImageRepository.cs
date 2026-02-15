@@ -106,7 +106,6 @@ namespace VerboVision.DataLayer.Repositories
             return new CoreSubjectsWrapper();
         }
 
-
         /// <summary>
         /// Анализирует изображение по URL: скачивает, вычисляет хеш, отправляет в GigaChat и сохраняет в БД
         /// </summary>
@@ -120,20 +119,27 @@ namespace VerboVision.DataLayer.Repositories
             {
                 // 1. Получаем изображение (массив байтов и имя файла)
                 var (imageBytes, fileName) = await DownloadImageAsync(url);
+                if (imageBytes.Length == 0)
+                    return (null, new CoreSubjectsWrapper());
 
                 // 2. Получаем хеш изображения
                 var imageHash = GetImageHash(imageBytes);
 
-                // 3. Отправляем изображение на обработку в AI
+                // 3. Проверка по хешу: если такое изображение уже есть, возвращаем существующую запись (без вызова GigaChat)
+                var imageEntity = await GetImageByHashAsync(imageHash, cToken);
+                if (imageEntity != null)
+                    return (imageEntity.Id, imageEntity.CoreSubjects ?? new CoreSubjectsWrapper());
+                
+                // 4. Отправляем изображение на обработку в AI
                 var (fileId, aiResponse, coreSubjects) = await GigaChatCommand.CheckImageAsync(autorizationKey, imageBytes, fileName);
 
-                // 4. Сохраняем данные изображения в БД
+                // 5. Сохраняем данные изображения в БД
                 var uUid = await AddImageInDbAsync(url, fileName, imageHash, fileId, aiResponse, coreSubjects, cToken);
 
                 return (uUid, coreSubjects);
             }
-            catch (OperationCanceledException)
-            {
+            catch (OperationCanceledException) 
+            { 
             }
             catch (ArgumentNullException ex)
             {
@@ -272,8 +278,13 @@ namespace VerboVision.DataLayer.Repositories
         {
             try
             {
+                // Защита от гонки, второй параллельный запрос с тем же файлом мог уже вставить запись
+                var existing = await GetImageByHashAsync(fileHash, cToken);
+                if (existing != null)
+                    return existing.Id;
+
                 var entity = new ImageEntity(url, fileName, fileHash, fileId, aiResponse, coreSubjects);
-                var entry = await _context.Images.AddAsync(entity, cToken);
+                await _context.Images.AddAsync(entity, cToken);
                 await _context.SaveChangesAsync(cToken);
 
                 return entity.Id;

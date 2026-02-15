@@ -38,8 +38,8 @@ namespace VerboVision.DataLayer.Helper
         /// <exception cref="ArgumentNullException">Выбрасывается, если <paramref name="imageBytes"/> равен null</exception>
         public static string ComputeSha256Hash(byte[] imageBytes)
         {
-            if (imageBytes == null)
-                throw new ArgumentNullException(nameof(imageBytes), "Массив байтов изображения не может быть null");
+            if (imageBytes == null || imageBytes.Length == 0)
+                throw new ArgumentNullException(nameof(imageBytes), "Массив байтов изображения не может быть null или пустым");
 
             using var stream = new MemoryStream(imageBytes);
             return ComputeSha256Hash(stream);

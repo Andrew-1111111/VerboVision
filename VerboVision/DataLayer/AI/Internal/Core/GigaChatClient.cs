@@ -33,6 +33,9 @@ namespace VerboVision.DataLayer.AI.Internal.Core
 
         // Ограничение на размер изображения
         private const int MAX_IMAGE_SIZE_BYTES = 15 * 1024 * 1024;      // 15 МБ для изображений
+
+        // Максимальное число повторных попыток при 401 (обновление токена и повтор запроса)
+        private const int MAX_401_RETRIES = 3;
         #endregion
 
         /// <summary>
@@ -70,71 +73,82 @@ namespace VerboVision.DataLayer.AI.Internal.Core
         /// <summary>
         /// Отправляет текстовый запрос (промпт) в GigaChat и получает текстовый ответ от модели
         /// </summary>
-        /// <param name="prompt">Текстовый запрос для модели GigaChat</param>
-        /// <param name="selectedModel">Идентификатор модели GigaChat (по умолчанию GigaChat-Pro)</param>
-        /// <param name="selectedTemperature">Параметр температуры (0-1), влияющий на креативность ответа. По умолчанию 0.7</param>
-        /// <param name="maxTokens">Максимальное количество токенов в ответе. По умолчанию 1000</param>
-        /// <returns>Текстовый ответ от модели GigaChat</returns>
-        /// <exception cref="ArgumentException">Выбрасывается, если промпт пустой</exception>
-        /// <exception cref="HttpRequestException">Выбрасывается при ошибке HTTP-запроса</exception>
-        /// <exception cref="InvalidOperationException">Выбрасывается, если ответ модели не содержит текста</exception>
+        /// <param name="prompt">Текстовый запрос</param>
+        /// <param name="selectedModel">Идентификатор модели</param>
+        /// <param name="selectedTemperature">Температура генерации (0.0-1.0)</param>
+        /// <param name="maxTokens">Максимальное число токенов в ответе</param>
+        /// <returns>Текстовый ответ модели</returns>
         public async Task<string> SendPromptAsync(
             string prompt,
             string selectedModel,
             double selectedTemperature = 0.7,
             int maxTokens = 1000)
         {
+            return await SendPromptAsyncCore(prompt, selectedModel, selectedTemperature, maxTokens, retry401Count: 0);
+        }
+
+        /// <summary>
+        /// Внутренний метод отправки промпта с поддержкой повторных попыток при 401 ошибке
+        /// </summary>
+        /// <param name="prompt">Текстовый запрос</param>
+        /// <param name="selectedModel">Идентификатор модели</param>
+        /// <param name="selectedTemperature">Температура генерации</param>
+        /// <param name="maxTokens">Максимальное число токенов</param>
+        /// <param name="retry401Count">Счетчик повторных попыток</param>
+        /// <returns>Текстовый ответ модели</returns>
+        /// <exception cref="ArgumentException">Выбрасывается при пустом промпте</exception>
+        /// <exception cref="HttpRequestException">Выбрасывается при ошибке HTTP</exception>
+        /// <exception cref="InvalidOperationException">Выбрасывается при пустом ответе модели</exception>
+        private async Task<string> SendPromptAsyncCore(
+            string prompt,
+            string selectedModel,
+            double selectedTemperature,
+            int maxTokens,
+            int retry401Count)
+        {
             if (string.IsNullOrWhiteSpace(prompt))
                 throw new ArgumentException("Промпт не может быть пустым.", nameof(prompt));
 
-            // Обновляем токен при необходимости
             await RefreshTokenAsync(false);
 
-            // Формируем запрос (без attachments, так как это чистый текстовый запрос)
             var requestBody = new
             {
                 model = selectedModel,
-                messages = new[]
-                {
-                    new
-                    {
-                        role = "user",
-                        content = prompt
-                    }
-                },
+                messages = new[] { new { role = "user", content = prompt } },
                 temperature = selectedTemperature,
                 max_tokens = maxTokens,
                 stream = false,
                 update_interval = 0
             };
 
-            // Сериализуем запрос
             var jsonContent = new StringContent(
                 JsonSerializer.Serialize(requestBody, _jsonOptions),
                 Encoding.UTF8,
                 "application/json");
 
-            // Отправляем запрос с таймаутом
             using var response = await AsyncExt.TimeoutAsync(_httpClient.PostAsync(COMPLETIONS_ENDPOINT, jsonContent), _timeout);
 
-            // Обрабатываем ответ
             if (!response.IsSuccessStatusCode)
             {
                 var errorContent = await AsyncExt.TimeoutAsync(
                     response.Content.ReadAsStringAsync(),
                     _timeout);
 
-                // Если токен истек, обновляем и повторяем
                 if (response.StatusCode == HttpStatusCode.Unauthorized)
                 {
+                    if (retry401Count >= MAX_401_RETRIES)
+                    {
+                        throw new HttpRequestException(
+                            $"Ошибка авторизации GigaChat после {MAX_401_RETRIES + 1} попыток. HTTP статус: 401. Детали: {errorContent}");
+                    }
+
                     await RefreshTokenAsync(true);
-                    return await SendPromptAsync(prompt, selectedModel, selectedTemperature, maxTokens);
+                    return await SendPromptAsyncCore(prompt, selectedModel, selectedTemperature, maxTokens, retry401Count + 1);
                 }
 
                 throw new HttpRequestException($"Ошибка при отправке промпта. Статус: {response.StatusCode}. Детали: {errorContent}");
             }
 
-            // Читаем и десериализуем ответ
             var jsonResponse = await AsyncExt.TimeoutAsync(
                 response.Content.ReadAsStringAsync(),
                 _timeout);
@@ -143,7 +157,6 @@ namespace VerboVision.DataLayer.AI.Internal.Core
                 jsonResponse,
                 _jsonOptions);
 
-            // Извлекаем текст ответа
             return completionResponse?.Choices?.FirstOrDefault()?.Message?.Content
                 ?? throw new InvalidOperationException("Ответ модели не содержит текстового содержимого.");
         }
@@ -180,6 +193,22 @@ namespace VerboVision.DataLayer.AI.Internal.Core
         /// <exception cref="InvalidOperationException">Выбрасывается, если ответ не содержит идентификатор файла</exception>
         public async Task<string> UploadFileAsync(byte[] fileBytes, string fileName, string mimeType)
         {
+            return await UploadFileAsyncCore(fileBytes, fileName, mimeType, retry401Count: 0);
+        }
+
+        /// <summary>
+        /// Внутренний метод загрузки файла с поддержкой повторных попыток при 401 ошибке
+        /// </summary>
+        /// <param name="fileBytes">Массив байтов файла</param>
+        /// <param name="fileName">Имя файла</param>
+        /// <param name="mimeType">MIME-тип</param>
+        /// <param name="retry401Count">Счетчик повторных попыток</param>
+        /// <returns>Уникальный идентификатор файла</returns>
+        /// <exception cref="ArgumentException">Выбрасывается при некорректных параметрах</exception>
+        /// <exception cref="HttpRequestException">Выбрасывается при ошибке HTTP</exception>
+        /// <exception cref="InvalidOperationException">Выбрасывается при отсутствии ID в ответе</exception>
+        private async Task<string> UploadFileAsyncCore(byte[] fileBytes, string fileName, string mimeType, int retry401Count)
+        {
             if (fileBytes == null || fileBytes.Length == 0)
                 throw new ArgumentException("Массив байтов файла не может быть пустым.", nameof(fileBytes));
 
@@ -192,15 +221,11 @@ namespace VerboVision.DataLayer.AI.Internal.Core
             await RefreshTokenAsync(false);
 
             using var formData = new MultipartFormDataContent();
-
             var fileContent = new ByteArrayContent(fileBytes);
             fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse(mimeType);
             formData.Add(fileContent, "file", fileName);
-
-            // purpose всегда "general" для всех типов файлов
             formData.Add(new StringContent("general"), "purpose");
 
-            // Используем эндпоинт для загрузки файлов
             using var response = await AsyncExt.TimeoutAsync(_httpClient.PostAsync(FILES_ENDPOINT, formData), _timeout);
 
             if (!response.IsSuccessStatusCode)
@@ -209,8 +234,14 @@ namespace VerboVision.DataLayer.AI.Internal.Core
 
                 if (response.StatusCode == HttpStatusCode.Unauthorized)
                 {
+                    if (retry401Count >= MAX_401_RETRIES)
+                    {
+                        throw new HttpRequestException(
+                            $"Ошибка авторизации GigaChat после {MAX_401_RETRIES + 1} попыток. HTTP статус: 401. Детали: {errorContent}");
+                    }
+
                     await RefreshTokenAsync(true);
-                    return await UploadFileAsync(fileBytes, fileName, mimeType);
+                    return await UploadFileAsyncCore(fileBytes, fileName, mimeType, retry401Count + 1);
                 }
 
                 throw new HttpRequestException($"Ошибка загрузки файла. Статус: {response.StatusCode}. Детали: {errorContent}");
@@ -234,6 +265,22 @@ namespace VerboVision.DataLayer.AI.Internal.Core
         /// <exception cref="InvalidOperationException">Выбрасывается, если ответ модели не содержит текста</exception>
         public async Task<string> AnalyzeFileAsync(string prompt, string fileId, string selectedModel)
         {
+            return await AnalyzeFileAsyncCore(prompt, fileId, selectedModel, retry401Count: 0);
+        }
+
+        /// <summary>
+        /// Внутренний метод анализа файла с поддержкой повторных попыток при 401 ошибке
+        /// </summary>
+        /// <param name="prompt">Текстовый запрос</param>
+        /// <param name="fileId">Идентификатор файла</param>
+        /// <param name="selectedModel">Модель для анализа</param>
+        /// <param name="retry401Count">Счетчик повторных попыток</param>
+        /// <returns>Текстовый ответ модели</returns>
+        /// <exception cref="ArgumentException">Выбрасывается при пустых параметрах</exception>
+        /// <exception cref="HttpRequestException">Выбрасывается при ошибке HTTP</exception>
+        /// <exception cref="InvalidOperationException">Выбрасывается при пустом ответе</exception>
+        private async Task<string> AnalyzeFileAsyncCore(string prompt, string fileId, string selectedModel, int retry401Count)
+        {
             if (string.IsNullOrWhiteSpace(prompt))
                 throw new ArgumentException("Промпт не может быть пустым.", nameof(prompt));
 
@@ -245,15 +292,7 @@ namespace VerboVision.DataLayer.AI.Internal.Core
             var analyzeRequest = new
             {
                 model = selectedModel,
-                messages = new[]
-                {
-                    new
-                    {
-                        role = "user",
-                        content = prompt,
-                        attachments = new[] { fileId }
-                    }
-                },
+                messages = new[] { new { role = "user", content = prompt, attachments = new[] { fileId } } },
                 stream = false,
                 update_interval = 0
             };
@@ -271,8 +310,14 @@ namespace VerboVision.DataLayer.AI.Internal.Core
 
                 if (response.StatusCode == HttpStatusCode.Unauthorized)
                 {
+                    if (retry401Count >= MAX_401_RETRIES)
+                    {
+                        throw new HttpRequestException(
+                            $"Ошибка авторизации GigaChat после {MAX_401_RETRIES + 1} попыток. HTTP статус: 401. Детали: {errorContent}");
+                    }
+
                     await RefreshTokenAsync(true);
-                    return await AnalyzeFileAsync(prompt, fileId, selectedModel);
+                    return await AnalyzeFileAsyncCore(prompt, fileId, selectedModel, retry401Count + 1);
                 }
 
                 throw new HttpRequestException($"Ошибка при анализе. Статус: {response.StatusCode}. Детали: {errorContent}");
@@ -364,7 +409,7 @@ namespace VerboVision.DataLayer.AI.Internal.Core
         }
 
         /// <summary>
-        /// Освобождает управляемые ресурсы, используемые клиентом
+        /// Освобождает управляемые ресурсы
         /// </summary>
         public void Dispose()
         {
