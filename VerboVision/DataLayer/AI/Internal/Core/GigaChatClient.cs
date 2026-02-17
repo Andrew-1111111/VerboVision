@@ -22,6 +22,7 @@ namespace VerboVision.DataLayer.AI.Internal.Core
         private readonly JsonSerializerOptions _jsonOptions;
         private readonly SemaphoreSlim _tokenLock = new(1, 1);
         private static readonly TimeSpan _timeout = TimeSpan.FromSeconds(60); // Таймаут запроса
+        private static readonly TimeSpan _refreshTokenTimeout = TimeSpan.FromSeconds(5); // Таймаут запроса обновление токена
         #endregion
 
         #region Константы
@@ -393,6 +394,10 @@ namespace VerboVision.DataLayer.AI.Internal.Core
                 // После захвата семафора проверяем снова (double check)
                 if (!forceRefresh && DateTime.UtcNow < _tokenExpiryTime.AddMinutes(-1))
                     return;
+
+                // Небольшая задержка при принудительном обновлении токена
+                if (forceRefresh)
+                    await Task.Delay(_refreshTokenTimeout);
 
                 var newToken = await GetAccessTokenAsync();
                 _accessToken = newToken;

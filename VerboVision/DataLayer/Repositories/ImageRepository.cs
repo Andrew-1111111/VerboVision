@@ -211,7 +211,7 @@ namespace VerboVision.DataLayer.Repositories
                 }
 
                 // Скачиваем с контролем размера
-                await using var contentStream = await response.Content.ReadAsStreamAsync();
+                await using var contentStream = await AsyncExt.TimeoutAsync(response.Content.ReadAsStreamAsync(), TIMEOUT);
                 await using var memoryStream = new MemoryStream();
 
                 var buffer = new byte[81920];
